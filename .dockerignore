@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+.env
+.venv
+.git
+.DS_Store
+GW.json
+chat.md
