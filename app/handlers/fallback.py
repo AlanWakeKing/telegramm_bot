@@ -1,14 +1,15 @@
-
-from aiogram import Router, F
+﻿from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from .screen import edit_screen
 
 router = Router()
 
 
 @router.callback_query(F.data == "help:stub")
-async def help_stub(call: CallbackQuery):
-    await call.message.answer("❓ Инструкции скоро будут добавлены.")
+async def help_stub(call: CallbackQuery, session: AsyncSession):
+    await edit_screen(call.message, session, "❓ Инструкции скоро будут добавлены.")
     await call.answer()
 
 
@@ -20,10 +21,10 @@ async def nav_menu(call: CallbackQuery, session: AsyncSession):
     if not u:
         await call.answer()
         return
-    await render_menu(call.message, session, u.get("role", "user"))
+    await render_menu(call.message, session, u.get("role", "user"), tg_user_id=call.from_user.id)
     await call.answer()
 
 
 @router.message(F.text)
-async def unknown(message: Message):
-    await message.answer("Команда не распознана. Откройте меню: /start")
+async def unknown(message: Message, session: AsyncSession):
+    await edit_screen(message, session, "Команда не распознана. Откройте меню: /start")

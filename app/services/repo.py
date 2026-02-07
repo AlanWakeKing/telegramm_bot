@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,6 +70,226 @@ async def load_user_with_session(session: AsyncSession, tg_user_id: int) -> dict
     res = await session.execute(q, {"tg_user_id": tg_user_id})
     row = res.mappings().first()
     return dict(row) if row else None
+
+
+async def load_user_by_id(session: AsyncSession, user_id: int) -> dict[str, Any] | None:
+    q = text(
+        """
+        select id as user_id, tg_user_id, chat_id, username, role, is_blocked,
+               referrer_id, referral_code
+        from tg_users
+        where id = :user_id
+        limit 1;
+        """
+    )
+    res = await session.execute(q, {"user_id": user_id})
+    row = res.mappings().first()
+    return dict(row) if row else None
+
+
+async def _load_setting(session: AsyncSession, key: str, default: Any) -> Any:
+    q = text(
+        """
+        select value_json
+        from bot_settings
+        where key = :key
+        limit 1;
+        """
+    )
+    res = await session.execute(q, {"key": key})
+    row = res.mappings().first()
+    if not row:
+        await session.execute(
+            text("insert into bot_settings (key, value_json, updated_at) values (:key, CAST(:value AS jsonb), now())"),
+            {"key": key, "value": json.dumps(default)},
+        )
+        return default
+    return row["value_json"]
+
+
+async def _save_setting(session: AsyncSession, key: str, value: Any) -> None:
+    await session.execute(
+        text(
+            """
+            insert into bot_settings (key, value_json, updated_at)
+            values (:key, CAST(:value AS jsonb), now())
+            on conflict (key) do update set value_json = excluded.value_json, updated_at = now();
+            """
+        ),
+        {"key": key, "value": json.dumps(value)},
+    )
+
+
+DEFAULT_REFERRAL_SETTINGS = {
+    "percent": 10,
+    "delay_hours": 24,
+}
+
+
+async def get_referral_settings(session: AsyncSession) -> dict[str, Any]:
+    return await _load_setting(session, "REFERRAL_SETTINGS", DEFAULT_REFERRAL_SETTINGS)
+
+
+async def get_referral_pending(session: AsyncSession) -> list[dict[str, Any]]:
+    return await _load_setting(session, "REFERRAL_PENDING", [])
+
+
+async def get_ref_withdrawals(session: AsyncSession) -> list[dict[str, Any]]:
+    return await _load_setting(session, "REFERRAL_WITHDRAWALS", [])
+
+
+async def add_ref_withdraw_request(session: AsyncSession, user_id: int, amount: int) -> str | None:
+    withdrawals = await get_ref_withdrawals(session)
+    for item in withdrawals:
+        if int(item.get("user_id") or 0) == user_id and item.get("status") == "pending":
+            return None
+    req_id = f"RW{int(datetime.now(timezone.utc).timestamp())}{user_id}"
+    withdrawals.append({
+        "id": req_id,
+        "user_id": user_id,
+        "amount": int(amount),
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await _save_setting(session, "REFERRAL_WITHDRAWALS", withdrawals)
+    return req_id
+
+
+async def get_ref_withdraw_request(session: AsyncSession, req_id: str) -> dict[str, Any] | None:
+    withdrawals = await get_ref_withdrawals(session)
+    for item in withdrawals:
+        if item.get("id") == req_id:
+            return item
+    return None
+
+
+async def update_ref_withdraw_status(session: AsyncSession, req_id: str, status: str, meta: dict | None = None) -> None:
+    withdrawals = await get_ref_withdrawals(session)
+    updated: list[dict[str, Any]] = []
+    for item in withdrawals:
+        if item.get("id") == req_id:
+            item = dict(item)
+            item["status"] = status
+            if meta:
+                item["meta"] = meta
+            updated.append(item)
+        else:
+            updated.append(item)
+    await _save_setting(session, "REFERRAL_WITHDRAWALS", updated)
+
+
+async def count_referrals(session: AsyncSession, referrer_user_id: int) -> int:
+    q = text(
+        """
+        select count(*) as cnt
+        from tg_users
+        where referrer_id = :referrer_id;
+        """
+    )
+    res = await session.execute(q, {"referrer_id": referrer_user_id})
+    row = res.mappings().first()
+    return int(row["cnt"]) if row else 0
+
+
+async def get_referral_wallet(session: AsyncSession, referrer_user_id: int) -> int:
+    key = f"REF_WALLET_{referrer_user_id}"
+    value = await _load_setting(session, key, {"balance": 0})
+    try:
+        if isinstance(value, dict):
+            return int(value.get("balance") or 0)
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+async def add_referral_wallet(session: AsyncSession, referrer_user_id: int, amount: int) -> int:
+    current = await get_referral_wallet(session, referrer_user_id)
+    new_balance = current + int(amount)
+    key = f"REF_WALLET_{referrer_user_id}"
+    await _save_setting(session, key, {"balance": new_balance})
+    return new_balance
+
+
+async def clear_referral_wallet(session: AsyncSession, referrer_user_id: int) -> None:
+    key = f"REF_WALLET_{referrer_user_id}"
+    await _save_setting(session, key, {"balance": 0})
+
+
+async def add_referral_pending(
+    session: AsyncSession,
+    referrer_user_id: int,
+    referred_user_id: int,
+    amount_minor: int,
+    order_id: int,
+) -> int:
+    settings = await get_referral_settings(session)
+    percent = int(settings.get("percent") or 0)
+    if percent <= 0:
+        return 0
+    bonus = int(amount_minor * percent / 100)
+    if bonus <= 0:
+        return 0
+    pending = await get_referral_pending(session)
+    if any(p.get("order_id") == order_id for p in pending):
+        return 0
+    due_at = datetime.now(timezone.utc) + timedelta(hours=int(settings.get("delay_hours") or 0))
+    pending.append({
+        "order_id": order_id,
+        "referrer_user_id": referrer_user_id,
+        "referred_user_id": referred_user_id,
+        "amount_minor": amount_minor,
+        "bonus_minor": bonus,
+        "percent": percent,
+        "due_at": due_at.isoformat(),
+    })
+    await _save_setting(session, "REFERRAL_PENDING", pending)
+    return bonus
+
+
+async def has_referral_bonus(session: AsyncSession, order_id: int) -> bool:
+    q = text(
+        """
+        select 1
+        from balance_transactions
+        where reason = 'referral_bonus'
+          and meta->>'order_id' = CAST(:order_id AS text)
+        limit 1;
+        """
+    )
+    res = await session.execute(q, {"order_id": order_id})
+    row = res.mappings().first()
+    return bool(row)
+
+
+async def process_referral_pending(session: AsyncSession, referrer_user_id: int) -> int:
+    pending = await get_referral_pending(session)
+    if not pending:
+        return 0
+    now = datetime.now(timezone.utc)
+    new_pending: list[dict[str, Any]] = []
+    applied = 0
+    for item in pending:
+        if int(item.get("referrer_user_id") or 0) != referrer_user_id:
+            new_pending.append(item)
+            continue
+        due_at_raw = item.get("due_at")
+        try:
+            due_at = datetime.fromisoformat(due_at_raw)
+        except Exception:
+            due_at = now
+        if due_at > now:
+            new_pending.append(item)
+            continue
+        order_id = int(item.get("order_id") or 0)
+        if order_id and await has_referral_bonus(session, order_id):
+            continue
+        bonus = int(item.get("bonus_minor") or 0)
+        if bonus <= 0:
+            continue
+        await add_referral_wallet(session, referrer_user_id, bonus)
+        applied += 1
+    await _save_setting(session, "REFERRAL_PENDING", new_pending)
+    return applied
 
 
 async def set_state_clear(session: AsyncSession, tg_user_id: int, state: str) -> None:

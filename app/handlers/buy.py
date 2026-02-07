@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from ..services import repo
 from .menu import build_menu
+from .screen import edit_screen
 
 router = Router()
 
@@ -31,7 +32,7 @@ def servers_keyboard(servers: list[dict]) -> InlineKeyboardMarkup:
             label_load = f" [{pct}%]"
         else:
             label_load = f" [{active}]"
-        label = f"{s['name']}{' ('+s['country']+')' if s['country'] else ''}{label_load}"
+        label = f"{s['name']}{' (' + s['country'] + ')' if s['country'] else ''}{label_load}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buy:srv:{s['id']}")])
     rows.append([
         InlineKeyboardButton(text="⬅️ Назад", callback_data="buy:back"),
@@ -73,46 +74,39 @@ def need_balance_kb() -> InlineKeyboardMarkup:
     ])
 
 
-async def edit_screen(message: Message, session: AsyncSession, text: str, reply_markup: InlineKeyboardMarkup | None = None):
-    user = await repo.load_user_with_session(session, message.from_user.id)
-    msg_id = None
-    if user:
-        ui = (user.get("payload") or {}).get("ui") or {}
-        msg_id = ui.get("screen_message_id")
-    try:
-        if msg_id:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=msg_id,
-                text=text,
-                reply_markup=reply_markup,
-            )
-            return
-    except Exception:
-        pass
-    sent = await message.answer(text, reply_markup=reply_markup)
-    await repo.set_state_payload(session, message.from_user.id, "menu", "ui", {"screen_message_id": sent.message_id})
-    await session.commit()
+def step1_text() -> str:
+    return (
+        "ШАГ 1 — Выбор протокола подключения\n\n"
+        "Я предлагаю три протокола подключения: VLESS, ShadowSocks, Outline и WireGuard.\n\n"
+        "Рекомендуется использовать протокол VLESS — на нем работает режим DOUBLEVPN. "
+        "Этот режим использует сразу несколько серверов одновременно, при каждом включении VPN "
+        "он меняет сервер автоматически, без необходимости менять ключ. Для IP и доменов РФ "
+        "трафик идет в обход VPN с сервера РФ — это сделано специально, чтобы не ломались сайты "
+        "и мессенджеры.\n\n"
+        "Протоколы ShadowSocks, Outline или WireGuard — резервные.\n\n"
+        "При смене протокола или сервера выдается новый ключ, а предыдущий аннулируется.\n\n"
+        "Если вам нужен постоянный российский IP — такой сервер доступен в протоколе Outline.\n"
+    )
+
+
+def step2_text() -> str:
+    return (
+        "ШАГ 2 — Выбор сервера подключения\n"
+        "Рекомендую использовать сервера DOUBLEVPN — это сразу несколько серверов в одном.\n"
+        "Вы один раз создаете ключ, и сервер автоматически меняется при каждом включении/выключении VPN.\n\n"
+        "В квадратных скобках указана заселенность сервера: чем цифра меньше — тем лучше.\n\n"
+        "Если вам нужен постоянный IP-адрес конкретной страны — выберите конкретный сервер.\n"
+        "В любой другой ситуации выбирайте менее заселенный сервер DOUBLEVPN."
+    )
 
 
 @router.message(F.text == "🌐 Подключить VPN")
-async def buy_start(message: Message, session: AsyncSession):
-    await repo.set_state_clear(session, message.from_user.id, "buy_protocol")
+async def buy_start(message: Message, session: AsyncSession, tg_user_id: int | None = None):
+    user_id = tg_user_id or message.from_user.id
+    await repo.set_state_clear(session, user_id, "buy_protocol")
     await session.commit()
 
-    text = (
-        "ШАГ 1 — Выбор протокола подключения\n\n"
-        "Я предлагаю три протокола подключения: VLESS, ShadowSocks,Outline и Wireguard.\n\n"
-        "Рекомендуется использовать протокол VLESS — на нём работает режим DOUBLEVPN. "
-        "Этот режим использует сразу несколько серверов одновременно, при каждом включении VPN "
-        "он меняет сервер автоматически, без необходимости менять ключ. Для айпи и доменов рф "
-        "трафик идет в обход ВПН с сервера рф - это сделано специально что бы не ломались сайты "
-        "и мессенджеры.\n\n"
-        "Протоколы ShadowSocks или Outline или Wireguard — резервные.\n\n"
-        "При смене протокола или сервера выдается новый ключ, а предыдущий аннулируется.\n\n"
-        "Если вам нужен постоянный российский IP - такой сервер доступен в протоколе OutLine.\n"
-    )
-    await edit_screen(message, session, text, reply_markup=proto_keyboard())
+    await edit_screen(message, session, step1_text(), reply_markup=proto_keyboard(), tg_user_id=user_id)
 
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -128,25 +122,14 @@ async def buy_callbacks(call: CallbackQuery, session: AsyncSession):
     if action == "cancel":
         await repo.set_state_clear(session, call.from_user.id, "menu")
         await session.commit()
-        await call.message.edit_text("Отменено.", reply_markup=None)
-        from .menu import render_menu
-        await render_menu(call.message, session, user.get("role", "user"))
+        await edit_screen(call.message, session, "Отменено.", reply_markup=build_menu(user.get("role", "user")))
         await call.answer()
         return
 
     if action == "back":
         await repo.set_state_clear(session, call.from_user.id, "buy_protocol")
         await session.commit()
-        await call.message.edit_text("ШАГ 1 — Выбор протокола подключения\n\n"
-        "Я предлагаю три протокола подключения: VLESS, ShadowSocks,Outline и Wireguard.\n\n"
-        "Рекомендуется использовать протокол VLESS — на нём работает режим DOUBLEVPN. "
-        "Этот режим использует сразу несколько серверов одновременно, при каждом включении VPN "
-        "он меняет сервер автоматически, без необходимости менять ключ. Для айпи и доменов рф "
-        "трафик идет в обход ВПН с сервера рф - это сделано специально что бы не ломались сайты "
-        "и мессенджеры.\n\n"
-        "Протоколы ShadowSocks или Outline или Wireguard — резервные.\n\n"
-        "При смене протокола или сервера выдается новый ключ, а предыдущий аннулируется.\n\n"
-        "Если вам нужен постоянный российский IP - такой сервер доступен в протоколе OutLine.\n", reply_markup=proto_keyboard())
+        await edit_screen(call.message, session, step1_text(), reply_markup=proto_keyboard())
         await call.answer()
         return
 
@@ -157,18 +140,11 @@ async def buy_callbacks(call: CallbackQuery, session: AsyncSession):
         await session.commit()
 
         if not servers:
-            await call.message.edit_text("⚠️ Серверов пока нет.\nНапишите в 💬 Поддержка.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="buy:cancel")]]))
+            await edit_screen(call.message, session, "⚠️ Серверов пока нет.\nНапишите в 💬 Поддержка.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="buy:cancel")]]))
             await call.answer()
             return
 
-        await call.message.edit_text("ШАГ 2 — Выбор сервера подключения\n"
-																			"Рекомендую использовать сервера DOUBLEVPN — это сразу несколько серверов в одном."
-																			"Вы один раз создаёте ключ, и сервер автоматически меняется при каждом включении/выключении VPN.\n\n"
-																			"В квадратных скобках указана заселённость сервера: чем цифра меньше — тем лучше.\n\n"
-
-																			"Если вам нужен постоянный IP-адрес конкретной страны — выберите конкретный сервер.\n"
-																			"В любой другой ситуации выбирайте менее заселенный сервер DOUBLEVPN.",
-                   reply_markup=servers_keyboard(servers))
+        await edit_screen(call.message, session, step2_text(), reply_markup=servers_keyboard(servers))
         await call.answer()
         return
 
@@ -179,11 +155,11 @@ async def buy_callbacks(call: CallbackQuery, session: AsyncSession):
         await session.commit()
 
         if not plans:
-            await call.message.edit_text("⚠️ Тарифов пока нет.\nНапишите в 💬 Поддержка.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="buy:cancel")]]))
+            await edit_screen(call.message, session, "⚠️ Тарифов пока нет.\nНапишите в 💬 Поддержка.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="buy:cancel")]]))
             await call.answer()
             return
 
-        await call.message.edit_text("🛒 Покупка VPN\n\n3/3 Выберите тариф:", reply_markup=plans_keyboard(plans))
+        await edit_screen(call.message, session, "🛒 Покупка VPN\n\n3/3 Выберите тариф:", reply_markup=plans_keyboard(plans))
         await call.answer()
         return
 
@@ -206,7 +182,7 @@ async def buy_callbacks(call: CallbackQuery, session: AsyncSession):
         if is_trial:
             used = await repo.has_trial_used(session, user["user_id"])
             if used:
-                await call.message.edit_text("Пробный доступ уже был активирован ранее.")
+                await edit_screen(call.message, session, "Пробный доступ уже был активирован ранее.")
                 await call.answer()
                 return
             access_until = datetime.now(timezone.utc) + timedelta(days=int(plan.get("duration_days") or 0))
@@ -222,7 +198,9 @@ async def buy_callbacks(call: CallbackQuery, session: AsyncSession):
             await repo.log_event(session, "user_actions", "info", user["tg_user_id"], user["user_id"], "trial_issued", None, {"plan_id": plan_id})
             await session.commit()
 
-            await call.message.edit_text(
+            await edit_screen(
+                call.message,
+                session,
                 f"✅ Пробный доступ активирован.\nВаш ключ (заглушка):\n{config_uri}",
                 reply_markup=instructions_keyboard(),
             )
@@ -232,7 +210,9 @@ async def buy_callbacks(call: CallbackQuery, session: AsyncSession):
         price = int(plan.get("price_minor") or 0)
         balance = await repo.get_balance(session, user["user_id"])
         if balance < price:
-            await call.message.edit_text(
+            await edit_screen(
+                call.message,
+                session,
                 f"Недостаточно средств. Нужно {price} ₽, у вас {balance} ₽.\n\nПополните баланс.",
                 reply_markup=need_balance_kb(),
             )
@@ -253,7 +233,9 @@ async def buy_callbacks(call: CallbackQuery, session: AsyncSession):
         await repo.log_event(session, "payments", "info", user["tg_user_id"], user["user_id"], "balance_debit", None, {"plan_id": plan_id, "amount": price})
         await session.commit()
 
-        await call.message.edit_text(
+        await edit_screen(
+            call.message,
+            session,
             f"✅ Ключ выдан.\nВаш ключ (заглушка):\n{config_uri}\n\nОстаток баланса: {new_balance} ₽",
             reply_markup=instructions_keyboard(),
         )

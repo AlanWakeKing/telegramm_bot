@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -6,12 +6,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 
 from ..services import repo
+from .menu import build_menu
+from .screen import edit_screen_by_user
 
 router = Router()
 
 
 def admin_payment_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
+    return InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"pay:approve:{order_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"pay:reject:{order_id}"),
     ]])
@@ -19,7 +21,8 @@ def admin_payment_keyboard(order_id: int) -> InlineKeyboardMarkup:
 
 def instructions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📘 Инструкции", callback_data="help:stub")]
+        [InlineKeyboardButton(text="📘 Инструкции", callback_data="help:stub")],
+        [InlineKeyboardButton(text="↩️ В меню", callback_data="nav:menu")],
     ])
 
 
@@ -46,15 +49,28 @@ async def handle_payment_proof(message: Message, session: AsyncSession, bot):
         mime_type = "image/jpeg"
 
     if not file_id:
-        await message.answer("Пожалуйста, отправьте фото или PDF с оплатой.")
+        await edit_screen_by_user(
+            bot,
+            message.chat.id,
+            session,
+            message.from_user.id,
+            "Пожалуйста, отправьте фото или PDF с оплатой.",
+        )
         return
 
     payload = user.get("payload") or {}
 
     if user.get("state") == "topup_proof":
         amount = (payload.get("topup") or {}).get("amount")
+        code = (payload.get("topup") or {}).get("code")
         if not amount:
-            await message.answer("Сумма пополнения не найдена. Начните заново.")
+            await edit_screen_by_user(
+                bot,
+                message.chat.id,
+                session,
+                message.from_user.id,
+                "Сумма пополнения не найдена. Начните заново.",
+            )
             return
         plan = None
         protocol = None
@@ -66,8 +82,15 @@ async def handle_payment_proof(message: Message, session: AsyncSession, bot):
         server_id = connect.get("server_id")
         plan = await repo.load_plan(session, plan_id)
         if not plan:
-            await message.answer("Тариф не найден. Начните заново.")
+            await edit_screen_by_user(
+                bot,
+                message.chat.id,
+                session,
+                message.from_user.id,
+                "Тариф не найден. Начните заново.",
+            )
             return
+        code = None
 
     tg_file = await bot.get_file(file_id)
     file_bytes = await bot.download_file(tg_file.file_path)
@@ -79,13 +102,16 @@ async def handle_payment_proof(message: Message, session: AsyncSession, bot):
         data = bytes(file_bytes)
 
     if user.get("state") == "topup_proof":
+        meta = {"type": "topup", "amount": amount, "tg_file_id": file_id}
+        if code:
+            meta["code"] = code
         order_id = await repo.insert_payment_order(
             session,
             user_id=user["user_id"],
             plan_id=None,
             amount_minor=amount,
             currency="RUB",
-            meta={"type": "topup", "amount": amount, "tg_file_id": file_id},
+            meta=meta,
         )
     else:
         order_id = await repo.insert_payment_order(
@@ -102,14 +128,30 @@ async def handle_payment_proof(message: Message, session: AsyncSession, bot):
     await repo.set_state_clear(session, message.from_user.id, "menu")
     await session.commit()
 
-    await message.answer("Спасибо! Оплата получена на проверку. После подтверждения мы пришлём ключ.")
+    await edit_screen_by_user(
+        bot,
+        message.chat.id,
+        session,
+        message.from_user.id,
+        "Спасибо! Оплата получена на проверку. После подтверждения мы пришлём ключ.",
+        reply_markup=build_menu(user.get("role", "user")),
+    )
+
+    try:
+        await bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
     admin_ids = await repo.load_admin_ids(session)
     if user.get("state") == "topup_proof":
+        code_line = f"\nКод платежа: {code}" if code else ""
         text = (
             f"💳 Пополнение баланса\nOrder #{order_id}\n"
             f"Пользователь: @{user.get('username') or '-'} ({user['tg_user_id']})\n"
-            f"Сумма: {amount} RUB"
+            f"Сумма: {amount} RUB{code_line}"
         )
     else:
         price = plan["price_minor"]
@@ -140,7 +182,6 @@ async def handle_payment_proof(message: Message, session: AsyncSession, bot):
                         reply_markup=admin_payment_keyboard(order_id),
                     )
             except Exception:
-                # fallback to document if photo failed
                 await bot.send_document(
                     admin_id,
                     proof["tg_file_id"],
@@ -174,13 +215,41 @@ async def handle_admin_payment(call: CallbackQuery, session: AsyncSession, bot):
             amount = int((order.get("meta") or {}).get("amount") or order["amount_minor"])
             new_balance = await repo.apply_balance_delta(session, order["user_id"], amount, "topup", {"order_id": order_id})
             await repo.log_event(session, "admin_actions", "info", order["tg_user_id"], order["user_id"], "topup_approved", f"order {order_id}", {"order_id": order_id, "amount": amount})
+            try:
+                referred_user = await repo.load_user_by_id(session, order["user_id"])
+                if referred_user and referred_user.get("referrer_id") and referred_user["referrer_id"] != order["user_id"]:
+                    await repo.add_referral_pending(
+                        session,
+                        referrer_user_id=int(referred_user["referrer_id"]),
+                        referred_user_id=int(order["user_id"]),
+                        amount_minor=amount,
+                        order_id=order_id,
+                    )
+            except Exception:
+                pass
             await session.commit()
 
-            await bot.send_message(order["chat_id"], f"✅ Баланс пополнен на {amount} ₽.\nТекущий баланс: {new_balance} ₽")
+            role = "user"
+            user_info = await repo.load_user_with_session(session, order["tg_user_id"])
+            if user_info and user_info.get("role"):
+                role = user_info["role"]
+            await edit_screen_by_user(
+                bot,
+                order["chat_id"],
+                session,
+                order["tg_user_id"],
+                f"✅ Баланс пополнен на {amount} ₽.\nТекущий баланс: {new_balance} ₽",
+                reply_markup=build_menu(role),
+            )
             if call.message and call.message.text:
                 await call.message.edit_text("Пополнение подтверждено.")
             elif call.message:
                 await call.message.edit_caption("Пополнение подтверждено.")
+            if call.message:
+                try:
+                    await call.message.delete()
+                except Exception:
+                    pass
             await call.answer()
             return
 
@@ -197,10 +266,25 @@ async def handle_admin_payment(call: CallbackQuery, session: AsyncSession, bot):
             access_until=access_until,
         )
         await repo.log_event(session, "admin_actions", "info", order["tg_user_id"], order["user_id"], "payment_approved", f"order {order_id}", {"order_id": order_id})
+        try:
+            referred_user = await repo.load_user_by_id(session, order["user_id"])
+            if referred_user and referred_user.get("referrer_id") and referred_user["referrer_id"] != order["user_id"]:
+                await repo.add_referral_pending(
+                    session,
+                    referrer_user_id=int(referred_user["referrer_id"]),
+                    referred_user_id=int(order["user_id"]),
+                    amount_minor=int(order["amount_minor"] or 0),
+                    order_id=order_id,
+                )
+        except Exception:
+            pass
         await session.commit()
 
-        await bot.send_message(
+        await edit_screen_by_user(
+            bot,
             order["chat_id"],
+            session,
+            order["tg_user_id"],
             f"✅ Оплата подтверждена.\nВаш ключ (заглушка):\n{config_uri}",
             reply_markup=instructions_keyboard(),
         )
@@ -208,6 +292,11 @@ async def handle_admin_payment(call: CallbackQuery, session: AsyncSession, bot):
             await call.message.edit_text("Оплата подтверждена.")
         elif call.message:
             await call.message.edit_caption("Оплата подтверждена.")
+        if call.message:
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
         await call.answer()
         return
 
@@ -216,11 +305,27 @@ async def handle_admin_payment(call: CallbackQuery, session: AsyncSession, bot):
         await repo.log_event(session, "admin_actions", "info", order["tg_user_id"], order["user_id"], "payment_rejected", f"order {order_id}", {"order_id": order_id})
         await session.commit()
 
-        await bot.send_message(order["chat_id"], "Оплата не подтверждена. Если это ошибка — обратитесь в поддержку.")
+        user_info = await repo.load_user_with_session(session, order["tg_user_id"])
+        role = "user"
+        if user_info and user_info.get("role"):
+            role = user_info["role"]
+        await edit_screen_by_user(
+            bot,
+            order["chat_id"],
+            session,
+            order["tg_user_id"],
+            "Оплата не подтверждена. Если это ошибка — обратитесь в поддержку.",
+            reply_markup=build_menu(role),
+        )
         if call.message and call.message.text:
             await call.message.edit_text("Оплата отклонена.")
         elif call.message:
             await call.message.edit_caption("Оплата отклонена.")
+        if call.message:
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
         await call.answer()
         return
 

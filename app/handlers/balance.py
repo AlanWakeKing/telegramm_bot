@@ -1,10 +1,12 @@
-from aiogram import Router, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+﻿from aiogram import Router, F
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
+import secrets
 
 from ..services import repo
-from .menu import build_menu
+from .menu import build_menu, render_menu
+from .screen import edit_screen
 
 router = Router()
 
@@ -15,7 +17,7 @@ def access_payment_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Баланс", callback_data="paymenu:balance"),
             InlineKeyboardButton(text="Продление", callback_data="paymenu:renew"),
         ],
-        [InlineKeyboardButton(text="Главное меню ↩️", callback_data="paymenu:menu")],
+        [InlineKeyboardButton(text="В меню ↩️", callback_data="paymenu:menu")],
     ])
 
 
@@ -37,7 +39,10 @@ def topup_amount_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="2000 ₽", callback_data="topup:amount:2000"),
             InlineKeyboardButton(text="5000 ₽", callback_data="topup:amount:5000"),
         ],
-        [InlineKeyboardButton(text="↩️ Назад", callback_data="topup:back")],
+        [
+            InlineKeyboardButton(text="↩️ Назад", callback_data="topup:back"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="topup:cancel"),
+        ],
     ])
 
 
@@ -46,7 +51,10 @@ def topup_method_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Оплата переводом", callback_data="topup:method:transfer_link")],
         [InlineKeyboardButton(text="Оплата криптой", callback_data="topup:method:crypto")],
         [InlineKeyboardButton(text="Оплата рублями СБП", callback_data="topup:method:sbp_stub")],
-        [InlineKeyboardButton(text="↩️ Назад", callback_data="topup:back")],
+        [
+            InlineKeyboardButton(text="↩️ Назад", callback_data="topup:back"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="topup:cancel"),
+        ],
     ])
 
 
@@ -59,6 +67,7 @@ def renew_kb(index: int, total: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="➡️", callback_data="renew:next"),
             ],
             [InlineKeyboardButton(text="✅ Продлить", callback_data="renew:pick")],
+            [InlineKeyboardButton(text="↩️ В меню", callback_data="paymenu:menu")],
         ]
     )
 
@@ -76,28 +85,6 @@ def renew_plans_kb(plans: list[dict]) -> InlineKeyboardMarkup:
         )])
     rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="renew:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def edit_screen(message: Message, session: AsyncSession, text: str, reply_markup: InlineKeyboardMarkup | None = None):
-    user = await repo.load_user_with_session(session, message.from_user.id)
-    msg_id = None
-    if user:
-        ui = (user.get("payload") or {}).get("ui") or {}
-        msg_id = ui.get("screen_message_id")
-    try:
-        if msg_id:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=msg_id,
-                text=text,
-                reply_markup=reply_markup,
-            )
-            return
-    except Exception:
-        pass
-    sent = await message.answer(text, reply_markup=reply_markup)
-    await repo.set_state_payload(session, message.from_user.id, "menu", "ui", {"screen_message_id": sent.message_id})
-    await session.commit()
 
 
 def format_dt(dt: datetime | None) -> str:
@@ -127,10 +114,11 @@ def format_profile(p: dict, idx: int, total: int) -> str:
 
 
 @router.message(F.text == "💳 Оплата доступа")
-async def show_balance(message: Message, session: AsyncSession):
-    user = await repo.load_user_with_session(session, message.from_user.id)
+async def show_balance(message: Message, session: AsyncSession, tg_user_id: int | None = None):
+    user_id = tg_user_id or message.from_user.id
+    user = await repo.load_user_with_session(session, user_id)
     if not user:
-        await message.answer("Сессия не найдена. Нажми /start")
+        await edit_screen(message, session, "Сессия не найдена. Нажми /start", tg_user_id=user_id)
         return
     balance = await repo.get_balance(session, user["user_id"])
     info = (
@@ -142,7 +130,8 @@ async def show_balance(message: Message, session: AsyncSession):
         "2. После успешного пополнения баланса, откройте раздел «Продление», "
         "выберите необходимый срок подписки. После этого доступ сразу откроется."
     )
-    await edit_screen(message, session, f"{info}\n\nВаш баланс: {balance} ₽", reply_markup=access_payment_menu_kb())
+    await edit_screen(message, session, f"{info}\n\nВаш баланс: {balance} ₽", reply_markup=access_payment_menu_kb(), tg_user_id=user_id)
+
 
 @router.callback_query(F.data == "paymenu:balance")
 async def balance_details(call: CallbackQuery, session: AsyncSession):
@@ -153,7 +142,9 @@ async def balance_details(call: CallbackQuery, session: AsyncSession):
     balance = await repo.get_balance(session, user["user_id"])
     await repo.set_state_clear(session, call.from_user.id, "menu")
     await session.commit()
-    await call.message.edit_text(
+    await edit_screen(
+        call.message,
+        session,
         "Это ваш баланс.\n"
         "- Вы пополняете его рублями через Перевод, либо криптой, либо через покупку YooMoney.\n\n"
         "После успешного пополнения баланса, перейдите в раздел «Продление» и выберите необходимый срок подписки.\n"
@@ -167,7 +158,7 @@ async def balance_details(call: CallbackQuery, session: AsyncSession):
 async def topup_start(call: CallbackQuery, session: AsyncSession):
     await repo.set_state_clear(session, call.from_user.id, "topup_method")
     await session.commit()
-    await call.message.edit_text("Способ пополнения:", reply_markup=topup_method_kb())
+    await edit_screen(call.message, session, "Способ пополнения:", reply_markup=topup_method_kb())
     await call.answer()
 
 
@@ -176,7 +167,7 @@ async def topup_method(call: CallbackQuery, session: AsyncSession):
     method = call.data.split(":")[2]
     await repo.set_state_payload(session, call.from_user.id, "topup_amount", "topup", {"method": method})
     await session.commit()
-    await call.message.edit_text("Выберите сумму пополнения:", reply_markup=topup_amount_kb())
+    await edit_screen(call.message, session, "Выберите сумму пополнения:", reply_markup=topup_amount_kb())
     await call.answer()
 
 
@@ -195,20 +186,53 @@ async def topup_amount(call: CallbackQuery, session: AsyncSession, bot):
         return
 
     if method in ("transfer", "transfer_link"):
+        code = f"PAY-{secrets.token_hex(3).upper()}"
+        link = None
         if method == "transfer_link":
-            link = f"https://t-qr.ru/p.php?t=rcrriehmmobmmob&s={amount}&n=ALEKSEY&b=t-bank&l=hhzogrgcstnrzhhchms"
-            await call.message.edit_text(f"Ссылка на перевод:\n{link}\n\nСумма: {amount} ₽")
-        await repo.set_state_payload(session, call.from_user.id, "topup_proof", "topup", {"amount": amount, "method": "transfer"})
-        await session.commit()
-        await call.message.edit_text(
-            f"Переведите {amount} ₽ и пришлите фото/скрин/квитанцию (PDF)."
+            link = f"https://t-qr.ru/p.php?t=ucuulgfmmobmmrx&i={code}&n=ALEKSEY&b=t-bank"
+        await repo.set_state_payload(
+            session,
+            call.from_user.id,
+            "topup_proof",
+            "topup",
+            {"amount": amount, "method": "transfer", "code": code},
         )
-        await call.answer()
+        await session.commit()
+
+        if link:
+            text = (
+                f"Ссылка на перевод:\n{link}\n\n"
+                f"Сумма: {amount} ₽\n"
+                f"Код платежа: {code}\n\n"
+                f"Переведите {amount} ₽ и укажите код в комментарии к переводу.\n"
+                f"После оплаты пришлите фото/скрин/квитанцию (PDF)."
+            )
+        else:
+            text = (
+                f"Сумма: {amount} ₽\n"
+                f"Код платежа: {code}\n\n"
+                f"Переведите {amount} ₽ и укажите код в комментарии к переводу.\n"
+                f"После оплаты пришлите фото/скрин/квитанцию (PDF)."
+            )
+
+        await edit_screen(
+            call.message,
+            session,
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="topup:cancel")]
+            ]),
+            disable_web_page_preview=True,
+        )
+        try:
+            await call.answer()
+        except Exception:
+            pass
         return
 
     await repo.set_state_clear(session, call.from_user.id, "menu")
     await session.commit()
-    await call.message.edit_text("Этот способ оплаты временно недоступен.", reply_markup=access_payment_menu_kb())
+    await edit_screen(call.message, session, "Этот способ оплаты временно недоступен.", reply_markup=access_payment_menu_kb())
     await call.answer()
 
 
@@ -221,7 +245,19 @@ async def topup_back(call: CallbackQuery, session: AsyncSession):
     balance = await repo.get_balance(session, user["user_id"])
     await repo.set_state_clear(session, call.from_user.id, "menu")
     await session.commit()
-    await call.message.edit_text(f"Ваш баланс: {balance} ₽", reply_markup=access_payment_menu_kb())
+    await edit_screen(call.message, session, f"Ваш баланс: {balance} ₽", reply_markup=access_payment_menu_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "topup:cancel")
+async def topup_cancel(call: CallbackQuery, session: AsyncSession):
+    user = await repo.load_user_with_session(session, call.from_user.id)
+    if not user:
+        await call.answer()
+        return
+    await repo.set_state_clear(session, call.from_user.id, "menu")
+    await session.commit()
+    await render_menu(call.message, session, user.get("role", "user"), tg_user_id=call.from_user.id)
     await call.answer()
 
 
@@ -233,7 +269,7 @@ async def renew_start(call: CallbackQuery, session: AsyncSession):
         return
     profiles = await repo.list_active_profiles(session, user["user_id"])
     if not profiles:
-        await call.message.edit_text("У вас нет активных ключей.", reply_markup=access_payment_menu_kb())
+        await edit_screen(call.message, session, "У вас нет активных ключей.", reply_markup=access_payment_menu_kb())
         await call.answer()
         return
     index = 0
@@ -241,7 +277,7 @@ async def renew_start(call: CallbackQuery, session: AsyncSession):
     await session.commit()
     total = len(profiles)
     text = format_profile(profiles[index], index + 1, total)
-    await call.message.edit_text(text, reply_markup=renew_kb(index + 1, total))
+    await edit_screen(call.message, session, text, reply_markup=renew_kb(index + 1, total), parse_mode="HTML")
     await call.answer()
 
 
@@ -256,7 +292,7 @@ async def renew_nav(call: CallbackQuery, session: AsyncSession):
         return
     profiles = await repo.list_active_profiles(session, user["user_id"])
     if not profiles:
-        await call.message.edit_text("У вас нет активных ключей.", reply_markup=None)
+        await edit_screen(call.message, session, "У вас нет активных ключей.")
         await call.answer()
         return
     payload = user.get("payload") or {}
@@ -269,10 +305,7 @@ async def renew_nav(call: CallbackQuery, session: AsyncSession):
     await repo.set_state_payload(session, call.from_user.id, "renew", "renew", {"index": index})
     await session.commit()
     text = format_profile(profiles[index], index + 1, total)
-    try:
-        await call.message.edit_text(text, reply_markup=renew_kb(index + 1, total))
-    except Exception:
-        pass
+    await edit_screen(call.message, session, text, reply_markup=renew_kb(index + 1, total), parse_mode="HTML")
     await call.answer()
 
 
@@ -284,14 +317,13 @@ async def renew_select(call: CallbackQuery, session: AsyncSession):
         return
     profiles = await repo.list_active_profiles(session, user["user_id"])
     if not profiles:
-        await call.message.edit_text("У вас нет активных ключей.", reply_markup=None)
+        await edit_screen(call.message, session, "У вас нет активных ключей.")
         await call.answer()
         return
     payload = user.get("payload") or {}
     index = int((payload.get("renew") or {}).get("index") or 0)
     index = max(0, min(index, len(profiles) - 1))
     selected = profiles[index]
-    # block trial renewal
     if (selected.get("provider_meta") or {}).get("source") == "trial":
         await call.answer("Пробные ключи продлевать нельзя.", show_alert=True)
         return
@@ -299,10 +331,12 @@ async def renew_select(call: CallbackQuery, session: AsyncSession):
     await session.commit()
     plans = await repo.list_plans(session)
     if not plans:
-        await call.message.edit_text("Тарифы не найдены.", reply_markup=None)
+        await edit_screen(call.message, session, "Тарифы не найдены.")
         await call.answer()
         return
-    await call.message.edit_text(
+    await edit_screen(
+        call.message,
+        session,
         f"Выбран ключ:\n"
         f"Действует до: {format_dt(selected.get('access_until'))}\n\n"
         f"Выберите срок продления:",
@@ -320,28 +354,27 @@ async def renew_apply(call: CallbackQuery, session: AsyncSession):
     try:
         plan_id = int(call.data.split(":")[2])
     except Exception:
-        await call.message.edit_text("Не удалось определить тариф.")
+        await edit_screen(call.message, session, "Не удалось определить тариф.")
         await call.answer()
         return
     plan = await repo.load_plan(session, plan_id)
     if not plan:
-        await call.message.edit_text("Тариф не найден.")
+        await edit_screen(call.message, session, "Тариф не найден.")
         await call.answer()
         return
     payload = user.get("payload") or {}
     profile_id = (payload.get("renew") or {}).get("profile_id")
     if not profile_id:
-        await call.message.edit_text("Ключ не выбран.")
+        await edit_screen(call.message, session, "Ключ не выбран.")
         await call.answer()
         return
     price = int(plan.get("price_minor") or 0)
     balance = await repo.get_balance(session, user["user_id"])
     if balance < price:
-        await call.message.edit_text(f"Недостаточно средств. Нужно {price} ₽, у вас {balance} ₽.")
+        await edit_screen(call.message, session, f"Недостаточно средств. Нужно {price} ₽, у вас {balance} ₽.")
         await call.answer()
         return
 
-    # compute new access_until
     profiles = await repo.list_active_profiles(session, user["user_id"])
     current = next((p for p in profiles if p["id"] == profile_id), None)
     base = datetime.now(timezone.utc)
@@ -353,7 +386,7 @@ async def renew_apply(call: CallbackQuery, session: AsyncSession):
 
     updated = await repo.update_profile_access_until(session, profile_id, new_until)
     if not updated:
-        await call.message.edit_text("Не удалось продлить ключ. Попробуйте позже.")
+        await edit_screen(call.message, session, "Не удалось продлить ключ. Попробуйте позже.")
         await call.answer()
         return
     new_balance = await repo.apply_balance_delta(session, user["user_id"], -price, "renew", {"plan_id": plan_id, "profile_id": profile_id})
@@ -361,8 +394,12 @@ async def renew_apply(call: CallbackQuery, session: AsyncSession):
     await repo.set_state_clear(session, call.from_user.id, "menu")
     await session.commit()
 
-    await call.message.edit_text(f"✅ Продление успешно.\nДействует до: {format_dt(new_until)}\nБаланс: {new_balance} ₽")
-    await call.message.answer("🏠 Меню", reply_markup=build_menu(user.get("role", "user")))
+    await edit_screen(
+        call.message,
+        session,
+        f"✅ Продление успешно.\nДействует до: {format_dt(new_until)}\nБаланс: {new_balance} ₽",
+        reply_markup=build_menu(user.get("role", "user")),
+    )
     await call.answer()
 
 
@@ -374,8 +411,7 @@ async def back_to_menu(call: CallbackQuery, session: AsyncSession):
         return
     await repo.set_state_clear(session, call.from_user.id, "menu")
     await session.commit()
-    from .menu import render_menu
-    await render_menu(call.message, session, user.get("role", "user"))
+    await render_menu(call.message, session, user.get("role", "user"), tg_user_id=call.from_user.id)
     await call.answer()
 
 
@@ -390,7 +426,7 @@ async def renew_back_exit(call: CallbackQuery, session: AsyncSession):
         if not profiles:
             await repo.set_state_clear(session, call.from_user.id, "menu")
             await session.commit()
-            await call.message.edit_text("У вас нет активных ключей.", reply_markup=None)
+            await edit_screen(call.message, session, "У вас нет активных ключей.")
             await call.answer()
             return
         payload = user.get("payload") or {}
@@ -399,16 +435,13 @@ async def renew_back_exit(call: CallbackQuery, session: AsyncSession):
         await repo.set_state_payload(session, call.from_user.id, "renew", "renew", {"index": index})
         await session.commit()
         text = format_profile(profiles[index], index + 1, len(profiles))
-        try:
-            await call.message.edit_text(text, reply_markup=renew_kb(index + 1, len(profiles)))
-        except Exception:
-            pass
+        await edit_screen(call.message, session, text, reply_markup=renew_kb(index + 1, len(profiles)), parse_mode="HTML")
         await call.answer()
         return
 
     await repo.set_state_clear(session, call.from_user.id, "menu")
     await session.commit()
-    await call.message.answer("🏠 Меню", reply_markup=build_menu(user.get("role", "user")))
+    await render_menu(call.message, session, user.get("role", "user"), tg_user_id=call.from_user.id)
     await call.answer()
 
 
