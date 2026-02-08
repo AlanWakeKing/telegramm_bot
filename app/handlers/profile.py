@@ -15,6 +15,7 @@ router = Router()
 def profile_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Реферальная ссылка", callback_data="profile:ref")],
+        [InlineKeyboardButton(text="Обращения", callback_data="profile:tickets")],
         [
             InlineKeyboardButton(text="История оплат", callback_data="profile:payments"),
             InlineKeyboardButton(text="Уведомления", callback_data="profile:notify"),
@@ -76,6 +77,31 @@ def keys_kb(index: int, total: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def tickets_list_kb(index: int, total: int, can_close: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="⬅️", callback_data="ticket:prev"),
+            InlineKeyboardButton(text=f"{index}/{total}", callback_data="ticket:noop"),
+            InlineKeyboardButton(text="➡️", callback_data="ticket:next"),
+        ],
+        [InlineKeyboardButton(text="Открыть", callback_data="ticket:open")],
+    ]
+    if can_close:
+        rows.append([InlineKeyboardButton(text="Закрыть", callback_data="ticket:close")])
+    rows.append([InlineKeyboardButton(text="↩️ В профиль", callback_data="ticket:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ticket_view_kb(can_close: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="↩️ К обращениям", callback_data="ticket:backlist")],
+        [InlineKeyboardButton(text="↩️ В меню", callback_data="nav:menu")],
+    ]
+    if can_close:
+        rows.insert(0, [InlineKeyboardButton(text="Закрыть", callback_data="ticket:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def format_payment(p: dict, idx: int, total: int) -> str:
     amount = p.get("amount_minor")
     currency = p.get("currency") or "RUB"
@@ -120,6 +146,30 @@ def format_key(p: dict, idx: int, total: int) -> str:
     )
 
 
+def format_ticket(t: dict, idx: int, total: int) -> str:
+    status = "ОТКРЫТ" if t.get("status") == "open" else "ЗАКРЫТ"
+    created = t.get("created_at") or "-"
+    updated = t.get("updated_at") or "-"
+    msg_count = t.get("message_count") or 0
+    return (
+        f"Обращение #{t.get('user_ticket_id') or t.get('id')}\n"
+        f"Статус: {status}\n"
+        f"Создано: {created}\n"
+        f"Обновлено: {updated}\n"
+        f"Сообщений: {msg_count}\n\n"
+        f"Найдено: {total}"
+    )
+
+
+def format_ticket_messages(messages: list[dict], ticket_id: int, user_ticket_id: int | None = None) -> str:
+    display_id = user_ticket_id or ticket_id
+    lines = [f"Обращение #{display_id}\n"]
+    for m in messages:
+        sender = "Вы" if m.get("sender") == "user" else "Админ"
+        lines.append(f"{sender}: {m.get('text')}")
+    return "\n".join(lines)
+
+
 def build_profile_text(user: dict, profiles: list[dict], balance: int, settings: dict) -> str:
     active_count = len(profiles)
     now = datetime.now(timezone.utc)
@@ -153,6 +203,11 @@ def build_profile_text(user: dict, profiles: list[dict], balance: int, settings:
 
 
 async def build_referral_view(session: AsyncSession, bot, user: dict, back_callback: str) -> tuple[str, InlineKeyboardMarkup]:
+    try:
+        await repo.process_referral_pending_all(session)
+        await session.commit()
+    except Exception:
+        pass
     me = await bot.get_me()
     ref_code = user.get("referral_code") or f"REF{user['user_id']}"
     ref_link = f"https://t.me/{me.username}?start=ref{ref_code}"
@@ -220,6 +275,20 @@ async def profile_callbacks(call: CallbackQuery, session: AsyncSession, bot):
         total = len(history)
         text = format_payment(history[0], 1, total)
         await edit_screen(call.message, session, text, reply_markup=payments_kb(1, total, bool(history[0].get("tg_file_id")), False))
+        await call.answer()
+        return
+
+    if action == "tickets":
+        tickets = await repo.list_support_tickets_for_user(session, user["user_id"])
+        if not tickets:
+            await edit_screen(call.message, session, "Обращений пока нет.", reply_markup=profile_back_kb())
+            await call.answer()
+            return
+        await repo.set_state_payload(session, call.from_user.id, "support_tickets", "tickets", {"index": 0, "view": "list"})
+        await session.commit()
+        t = tickets[0]
+        text = format_ticket(t, 1, len(tickets))
+        await edit_screen(call.message, session, text, reply_markup=tickets_list_kb(1, len(tickets), t.get("status") == "open"))
         await call.answer()
         return
 
@@ -429,8 +498,136 @@ async def pkeys_back(call: CallbackQuery, session: AsyncSession):
     await call.answer()
 
 
-@router.callback_query(F.data.in_({"payhist:noop", "pkeys:noop"}))
+@router.callback_query(F.data.in_({"payhist:noop", "pkeys:noop", "ticket:noop"}))
 async def noop(call: CallbackQuery):
+    await call.answer()
+
+
+@router.callback_query(F.data.in_({"ticket:prev", "ticket:next"}))
+async def ticket_nav(call: CallbackQuery, session: AsyncSession):
+    user = await repo.load_user_with_session(session, call.from_user.id)
+    if not user:
+        await call.answer()
+        return
+    tickets = await repo.list_support_tickets_for_user(session, user["user_id"])
+    if not tickets:
+        await edit_screen(call.message, session, "Обращений пока нет.", reply_markup=profile_back_kb())
+        await call.answer()
+        return
+    payload = user.get("payload") or {}
+    tstate = payload.get("tickets") or {}
+    index = int(tstate.get("index") or 0)
+    total = len(tickets)
+    if call.data == "ticket:prev":
+        index = (index - 1) % total
+    else:
+        index = (index + 1) % total
+    await repo.set_state_payload(session, call.from_user.id, "support_tickets", "tickets", {"index": index, "view": "list"})
+    await session.commit()
+    t = tickets[index]
+    text = format_ticket(t, index + 1, total)
+    await edit_screen(call.message, session, text, reply_markup=tickets_list_kb(index + 1, total, t.get("status") == "open"))
+    await call.answer()
+
+
+@router.callback_query(F.data == "ticket:open")
+async def ticket_open(call: CallbackQuery, session: AsyncSession):
+    user = await repo.load_user_with_session(session, call.from_user.id)
+    if not user:
+        await call.answer()
+        return
+    payload = user.get("payload") or {}
+    tstate = payload.get("tickets") or {}
+    index = int(tstate.get("index") or 0)
+    tickets = await repo.list_support_tickets_for_user(session, user["user_id"])
+    if not tickets:
+        await edit_screen(call.message, session, "Обращений пока нет.", reply_markup=profile_back_kb())
+        await call.answer()
+        return
+    index = max(0, min(index, len(tickets) - 1))
+    t = tickets[index]
+    msgs = await repo.list_support_messages_for_ticket(session, t["id"], limit=10)
+    text = format_ticket_messages(msgs, t["id"], t.get("user_ticket_id"))
+    text = f"{text}\n\nНапишите сообщение — я отправлю его в поддержку."
+    await repo.set_state_payload(session, call.from_user.id, "support_wait", "support", {"ticket_id": t["id"]})
+    await session.commit()
+    await edit_screen(call.message, session, text, reply_markup=ticket_view_kb(t.get("status") == "open"))
+    await call.answer()
+
+
+@router.callback_query(F.data == "ticket:backlist")
+async def ticket_backlist(call: CallbackQuery, session: AsyncSession):
+    user = await repo.load_user_with_session(session, call.from_user.id)
+    if not user:
+        await call.answer()
+        return
+    tickets = await repo.list_support_tickets_for_user(session, user["user_id"])
+    if not tickets:
+        await edit_screen(call.message, session, "Обращений пока нет.", reply_markup=profile_back_kb())
+        await call.answer()
+        return
+    payload = user.get("payload") or {}
+    tstate = payload.get("tickets") or {}
+    index = int(tstate.get("index") or 0)
+    index = max(0, min(index, len(tickets) - 1))
+    t = tickets[index]
+    text = format_ticket(t, index + 1, len(tickets))
+    await repo.set_state_payload(session, call.from_user.id, "support_tickets", "tickets", {"index": index, "view": "list"})
+    await session.commit()
+    await edit_screen(call.message, session, text, reply_markup=tickets_list_kb(index + 1, len(tickets), t.get("status") == "open"))
+    await call.answer()
+
+
+@router.callback_query(F.data == "ticket:close")
+async def ticket_close(call: CallbackQuery, session: AsyncSession):
+    user = await repo.load_user_with_session(session, call.from_user.id)
+    if not user:
+        await call.answer()
+        return
+    payload = user.get("payload") or {}
+    tstate = payload.get("tickets") or {}
+    index = int(tstate.get("index") or 0)
+    tickets = await repo.list_support_tickets_for_user(session, user["user_id"])
+    if not tickets:
+        await edit_screen(call.message, session, "Обращений пока нет.", reply_markup=profile_back_kb())
+        await call.answer()
+        return
+    index = max(0, min(index, len(tickets) - 1))
+    t = tickets[index]
+    if t.get("status") != "open":
+        await call.answer("Обращение уже закрыто", show_alert=True)
+        return
+    await repo.close_support_ticket(session, t["id"])
+    await session.commit()
+    tickets = await repo.list_support_tickets_for_user(session, user["user_id"])
+    if not tickets:
+        await repo.set_state_clear(session, call.from_user.id, "profile")
+        await session.commit()
+        await edit_screen(call.message, session, "Обращений пока нет.", reply_markup=profile_back_kb())
+        await call.answer()
+        return
+    index = max(0, min(index, len(tickets) - 1))
+    t = tickets[index]
+    text = format_ticket(t, index + 1, len(tickets))
+    await repo.set_state_payload(session, call.from_user.id, "support_tickets", "tickets", {"index": index, "view": "list"})
+    await session.commit()
+    await edit_screen(call.message, session, text, reply_markup=tickets_list_kb(index + 1, len(tickets), t.get("status") == "open"))
+    await call.answer()
+
+
+@router.callback_query(F.data == "ticket:back")
+async def ticket_back(call: CallbackQuery, session: AsyncSession):
+    user = await repo.load_user_with_session(session, call.from_user.id)
+    if not user:
+        await call.answer()
+        return
+    profiles = await repo.list_active_profiles(session, user["user_id"])
+    balance = await repo.get_balance(session, user["user_id"])
+    settings = await repo.get_user_settings(session, user["user_id"])
+    text = build_profile_text(user, profiles, balance, settings)
+    await repo.set_state_clear(session, call.from_user.id, "profile")
+    await session.commit()
+    await edit_screen(call.message, session, text, reply_markup=profile_kb())
     await call.answer()
 
 
@@ -451,13 +648,15 @@ async def ref_withdraw(call: CallbackQuery, session: AsyncSession, bot):
     await session.commit()
     admin_ids = await repo.load_admin_ids(session)
     text_admin = (
-        f"💸 Заявка на вывод\\n"
-        f"ID: {req_id}\\n"
-        f"Пользователь: @{user.get('username') or '-'} ({user['tg_user_id']})\\n"
-        f"Сумма: {wallet} ₽"
-    )
+    "💸 <b>Заявка на вывод средств</b>\n\n"
+    f"🆔 <b>ID заявки:</b> <code>{req_id}</code>\n"
+    f"👤 <b>Пользователь:</b> @{user.get('username') or '—'} "
+    f"(<code>{user['tg_user_id']}</code>)\n"
+    f"💰 <b>Сумма:</b> <b>{wallet} ₽</b>\n"
+    f"⏳ <b>Статус:</b> <i>ожидает подтверждения</i>"
+)
     for admin_id in admin_ids:
-        await bot.send_message(admin_id, text_admin, reply_markup=referral_admin_kb(req_id))
+        await bot.send_message(admin_id, text_admin, reply_markup=referral_admin_kb(req_id), parse_mode="HTML")
 
     text, kb = await build_referral_view(session, bot, user, "profile:back")
     text = f"{text}\n\n✅ Заявка отправлена. Мы рассмотрим её в ближайшее время."
@@ -523,7 +722,7 @@ async def ref_withdraw_admin(call: CallbackQuery, session: AsyncSession, bot):
                 target_user["chat_id"],
                 session,
                 target_user["tg_user_id"],
-                f"✅ Заявка одобрена. На баланс зачислено {amount} ₽.\\nТекущий баланс: {new_balance} ₽",
+                "✅ <b>Заявка одобрена</b>\n\n" f"💰 <b>Зачислено:</b> {amount} ₽\n" f"📊 <b>Текущий баланс:</b> {new_balance} ₽",
                 reply_markup=profile_back_kb(),
             )
             await call.answer("Заявка одобрена")
@@ -536,7 +735,7 @@ async def ref_withdraw_admin(call: CallbackQuery, session: AsyncSession, bot):
             target_user["chat_id"],
             session,
             target_user["tg_user_id"],
-            "❌ Заявка отклонена. Если это ошибка — обратитесь в поддержку.",
+            "❌ <b>Заявка отклонена.</b>\n\nЕсли это ошибка — обратитесь в поддержку.",
             reply_markup=profile_back_kb(),
         )
         await call.answer("Заявка отклонена")

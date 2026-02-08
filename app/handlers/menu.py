@@ -30,14 +30,23 @@ def build_menu(role: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏷️ Управление промокодами", callback_data="admin:promo")],
+        [InlineKeyboardButton(text="🖥️ Управление серверами", callback_data="admin:servers")],
+        [InlineKeyboardButton(text="👥 Управление пользователями", callback_data="admin:users")],
+        [InlineKeyboardButton(text="📊 Аналитика по пользователям", callback_data="admin:analytics")],
+        [InlineKeyboardButton(text="🔑 Управление ключами", callback_data="admin:keys")],
+        [InlineKeyboardButton(text="↩️ В меню", callback_data="nav:menu")],
+    ])
+
+
 async def render_menu(message: Message, session: AsyncSession, role: str, tg_user_id: int | None = None):
     text = "✅ Админ-меню" if role == "admin" else "✅ Меню"
     user_id = tg_user_id or message.from_user.id
     try:
-        user = await repo.load_user_with_session(session, user_id)
-        if user:
-            await repo.process_referral_pending(session, user["user_id"])
-            await session.commit()
+        await repo.process_referral_pending_all(session)
+        await session.commit()
     except Exception:
         pass
     await edit_screen(message, session, text, reply_markup=build_menu(role), tg_user_id=tg_user_id)
@@ -69,6 +78,10 @@ async def cmd_start(message: Message, session: AsyncSession):
     await session.commit()
 
     await render_menu(message, session, user["role"], tg_user_id=message.from_user.id)
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("menu:"))
@@ -97,7 +110,7 @@ async def menu_actions(call: CallbackQuery, session: AsyncSession):
         await call.answer("Недостаточно прав", show_alert=True)
         return
     if action == "admin":
-        await edit_screen(call.message, session, "Админ-панель будет добавлена позже.", reply_markup=build_menu(user.get("role", "user")))
+        await edit_screen(call.message, session, "🛠 Админ панель", reply_markup=admin_kb())
         await call.answer()
         return
     if action == "ref":
@@ -115,29 +128,28 @@ async def menu_actions(call: CallbackQuery, session: AsyncSession):
         return
 
     if action == "promo":
+        await repo.set_state_clear(session, call.from_user.id, "promo_wait")
+        await session.commit()
         await edit_screen(
             call.message,
             session,
-            "🏷️ Промокод\n\nФункция будет доступна позже.",
-            reply_markup=build_menu(user.get("role", "user")),
+            "🏷️ Промокод\n\nВведите промокод одним сообщением.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ В меню", callback_data="nav:menu")],
+            ]),
         )
         await call.answer()
         return
     if action == "support":
-        admins = await repo.load_admin_ids(session)
-        if admins:
-            admin_list = "\n".join([f"- {a}" for a in admins])
-        else:
-            admin_list = "Администраторы не настроены."
+        await repo.set_state_clear(session, call.from_user.id, "support_wait")
+        await session.commit()
         await edit_screen(
             call.message,
             session,
-            "✉️ Написать админу\n\n"
-            "Вы можете написать администратору прямо здесь.\n"
-            "ID админов:\n"
-            f"{admin_list}\n\n"
-            "Скоро добавим форму обращения.",
-            reply_markup=build_menu(user.get("role", "user")),
+            "✉️ Написать админу\n\nНапишите сообщение одним текстом — я передам его в поддержку.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ В меню", callback_data="nav:menu")],
+            ]),
         )
         await call.answer()
         return

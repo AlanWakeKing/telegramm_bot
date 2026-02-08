@@ -217,16 +217,27 @@ async def handle_admin_payment(call: CallbackQuery, session: AsyncSession, bot):
             await repo.log_event(session, "admin_actions", "info", order["tg_user_id"], order["user_id"], "topup_approved", f"order {order_id}", {"order_id": order_id, "amount": amount})
             try:
                 referred_user = await repo.load_user_by_id(session, order["user_id"])
-                if referred_user and referred_user.get("referrer_id") and referred_user["referrer_id"] != order["user_id"]:
-                    await repo.add_referral_pending(
-                        session,
-                        referrer_user_id=int(referred_user["referrer_id"]),
-                        referred_user_id=int(order["user_id"]),
-                        amount_minor=amount,
-                        order_id=order_id,
-                    )
-            except Exception:
-                pass
+                if referred_user and referred_user.get("referrer_id"):
+                    ref_user_id = await repo.resolve_referrer_user_id(session, int(referred_user["referrer_id"]))
+                    if ref_user_id and ref_user_id != order["user_id"]:
+                        await repo.add_referral_pending(
+                            session,
+                            referrer_user_id=ref_user_id,
+                            referred_user_id=int(order["user_id"]),
+                            amount_minor=amount,
+                            order_id=order_id,
+                        )
+            except Exception as exc:
+                await repo.log_event(
+                    session,
+                    "referral",
+                    "error",
+                    order["tg_user_id"],
+                    order["user_id"],
+                    "referral_pending_failed",
+                    str(exc),
+                    {"order_id": order_id},
+                )
             await session.commit()
 
             role = "user"
@@ -268,16 +279,27 @@ async def handle_admin_payment(call: CallbackQuery, session: AsyncSession, bot):
         await repo.log_event(session, "admin_actions", "info", order["tg_user_id"], order["user_id"], "payment_approved", f"order {order_id}", {"order_id": order_id})
         try:
             referred_user = await repo.load_user_by_id(session, order["user_id"])
-            if referred_user and referred_user.get("referrer_id") and referred_user["referrer_id"] != order["user_id"]:
-                await repo.add_referral_pending(
-                    session,
-                    referrer_user_id=int(referred_user["referrer_id"]),
-                    referred_user_id=int(order["user_id"]),
-                    amount_minor=int(order["amount_minor"] or 0),
-                    order_id=order_id,
-                )
-        except Exception:
-            pass
+            if referred_user and referred_user.get("referrer_id"):
+                ref_user_id = await repo.resolve_referrer_user_id(session, int(referred_user["referrer_id"]))
+                if ref_user_id and ref_user_id != order["user_id"]:
+                    await repo.add_referral_pending(
+                        session,
+                        referrer_user_id=ref_user_id,
+                        referred_user_id=int(order["user_id"]),
+                        amount_minor=int(order["amount_minor"] or 0),
+                        order_id=order_id,
+                    )
+        except Exception as exc:
+            await repo.log_event(
+                session,
+                "referral",
+                "error",
+                order["tg_user_id"],
+                order["user_id"],
+                "referral_pending_failed",
+                str(exc),
+                {"order_id": order_id},
+            )
         await session.commit()
 
         await edit_screen_by_user(

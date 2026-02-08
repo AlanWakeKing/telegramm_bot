@@ -125,57 +125,409 @@ DEFAULT_REFERRAL_SETTINGS = {
     "delay_hours": 24,
 }
 
+async def _ensure_support_schema(session: AsyncSession) -> None:
+    await session.execute(text("""
+        create table if not exists support_tickets (
+            id bigserial primary key,
+            user_id bigint not null references tg_users(id) on delete cascade,
+            tg_user_id bigint not null,
+            chat_id bigint not null,
+            username text,
+            status text not null default 'open',
+            user_ticket_id integer not null,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now(),
+            message_count integer not null default 0
+        );
+    """))
+    await session.execute(text("""
+        create unique index if not exists ux_support_tickets_user_id_user_ticket_id
+        on support_tickets(user_id, user_ticket_id);
+    """))
+    await session.execute(text("""
+        create table if not exists support_messages (
+            id bigserial primary key,
+            ticket_id bigint not null references support_tickets(id) on delete cascade,
+            sender text not null,
+            text text not null,
+            created_at timestamptz not null default now()
+        );
+    """))
+
+
+async def _ensure_promo_schema(session: AsyncSession) -> None:
+    await session.execute(text("""
+        create table if not exists promo_codes (
+            code text primary key,
+            bonus integer not null,
+            active boolean not null default true,
+            max_uses integer,
+            used_count integer not null default 0,
+            expires_at timestamptz,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now()
+        );
+    """))
+    await session.execute(text("""
+        create table if not exists promo_usages (
+            id bigserial primary key,
+            user_id bigint not null references tg_users(id) on delete cascade,
+            code text not null references promo_codes(code) on delete cascade,
+            used_at timestamptz not null default now(),
+            unique(user_id, code)
+        );
+    """))
+
+
+async def _ensure_referral_schema(session: AsyncSession) -> None:
+    await session.execute(text("""
+        create table if not exists referral_wallets (
+            user_id bigint primary key references tg_users(id) on delete cascade,
+            balance integer not null default 0,
+            updated_at timestamptz not null default now()
+        );
+    """))
+    await session.execute(text("""
+        create table if not exists referral_pending (
+            id bigserial primary key,
+            order_id bigint not null,
+            referrer_user_id bigint not null,
+            referred_user_id bigint not null,
+            amount_minor integer not null,
+            bonus_minor integer not null,
+            percent integer not null,
+            due_at timestamptz not null,
+            created_at timestamptz not null default now()
+        );
+    """))
+    await session.execute(text("""
+        create unique index if not exists ux_referral_pending_order_id
+        on referral_pending(order_id);
+    """))
+    await session.execute(text("""
+        create table if not exists referral_withdrawals (
+            id bigserial primary key,
+            user_id bigint not null references tg_users(id) on delete cascade,
+            amount integer not null,
+            status text not null default 'pending',
+            meta jsonb,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now()
+        );
+    """))
+DEFAULT_SUPPORT_SETTINGS = {
+    "admin_group_id": -5130507662,
+}
+
 
 async def get_referral_settings(session: AsyncSession) -> dict[str, Any]:
-    return await _load_setting(session, "REFERRAL_SETTINGS", DEFAULT_REFERRAL_SETTINGS)
+    raw = await _load_setting(session, "REFERRAL_SETTINGS", DEFAULT_REFERRAL_SETTINGS)
+    settings = dict(DEFAULT_REFERRAL_SETTINGS)
+    if isinstance(raw, dict):
+        settings.update(raw)
+    percent = settings.get("percent")
+    try:
+        if isinstance(percent, str):
+            percent = percent.strip().replace("%", "")
+        settings["percent"] = int(percent)
+    except Exception:
+        settings["percent"] = DEFAULT_REFERRAL_SETTINGS["percent"]
+    delay = settings.get("delay_hours")
+    try:
+        settings["delay_hours"] = int(delay)
+    except Exception:
+        settings["delay_hours"] = DEFAULT_REFERRAL_SETTINGS["delay_hours"]
+    if raw != settings:
+        await _save_setting(session, "REFERRAL_SETTINGS", settings)
+    return settings
 
 
-async def get_referral_pending(session: AsyncSession) -> list[dict[str, Any]]:
-    return await _load_setting(session, "REFERRAL_PENDING", [])
+async def get_support_settings(session: AsyncSession) -> dict[str, Any]:
+    raw = await _load_setting(session, "SUPPORT_SETTINGS", DEFAULT_SUPPORT_SETTINGS)
+    settings = dict(DEFAULT_SUPPORT_SETTINGS)
+    if isinstance(raw, dict):
+        settings.update(raw)
+    try:
+        settings["admin_group_id"] = int(settings.get("admin_group_id"))
+    except Exception:
+        settings["admin_group_id"] = DEFAULT_SUPPORT_SETTINGS["admin_group_id"]
+    if raw != settings:
+        await _save_setting(session, "SUPPORT_SETTINGS", settings)
+    return settings
 
 
-async def get_ref_withdrawals(session: AsyncSession) -> list[dict[str, Any]]:
-    return await _load_setting(session, "REFERRAL_WITHDRAWALS", [])
+async def get_admin_group_id(session: AsyncSession) -> int:
+    settings = await get_support_settings(session)
+    return int(settings.get("admin_group_id") or 0)
 
 
-async def add_ref_withdraw_request(session: AsyncSession, user_id: int, amount: int) -> str | None:
-    withdrawals = await get_ref_withdrawals(session)
-    for item in withdrawals:
-        if int(item.get("user_id") or 0) == user_id and item.get("status") == "pending":
-            return None
-    req_id = f"RW{int(datetime.now(timezone.utc).timestamp())}{user_id}"
-    withdrawals.append({
-        "id": req_id,
-        "user_id": user_id,
-        "amount": int(amount),
-        "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-    await _save_setting(session, "REFERRAL_WITHDRAWALS", withdrawals)
-    return req_id
-
-
-async def get_ref_withdraw_request(session: AsyncSession, req_id: str) -> dict[str, Any] | None:
-    withdrawals = await get_ref_withdrawals(session)
-    for item in withdrawals:
-        if item.get("id") == req_id:
-            return item
+async def resolve_referrer_user_id(session: AsyncSession, referrer_id: int) -> int | None:
+    if not referrer_id:
+        return None
+    user = await load_user_by_id(session, referrer_id)
+    if user:
+        return int(user["user_id"])
+    # fallback: treat as tg_user_id
+    user = await load_user_with_session(session, referrer_id)
+    if user:
+        return int(user["user_id"])
     return None
 
 
+async def get_referral_pending(session: AsyncSession) -> list[dict[str, Any]]:
+    await _ensure_referral_schema(session)
+    res = await session.execute(text("""
+        select id, order_id, referrer_user_id, referred_user_id, amount_minor, bonus_minor, percent, due_at
+        from referral_pending
+        order by id asc;
+    """))
+    return [dict(r) for r in res.mappings().all()]
+
+
+async def get_ref_withdrawals(session: AsyncSession) -> list[dict[str, Any]]:
+    await _ensure_referral_schema(session)
+    res = await session.execute(text("""
+        select id, user_id, amount, status, meta, created_at, updated_at
+        from referral_withdrawals
+        order by id desc;
+    """))
+    return [dict(r) for r in res.mappings().all()]
+
+
+async def add_ref_withdraw_request(session: AsyncSession, user_id: int, amount: int) -> str | None:
+    await _ensure_referral_schema(session)
+    # one pending per user
+    res = await session.execute(text("""
+        select id from referral_withdrawals
+        where user_id = :user_id and status = 'pending'
+        limit 1;
+    """), {"user_id": user_id})
+    if res.mappings().first():
+        return None
+    res = await session.execute(text("""
+        insert into referral_withdrawals (user_id, amount, status, created_at, updated_at)
+        values (:user_id, :amount, 'pending', now(), now())
+        returning id;
+    """), {"user_id": user_id, "amount": int(amount)})
+    row = res.mappings().first()
+    return f"RW{row['id']}" if row else None
+
+
+async def get_ref_withdraw_request(session: AsyncSession, req_id: str) -> dict[str, Any] | None:
+    await _ensure_referral_schema(session)
+    raw = str(req_id or "")
+    if raw.upper().startswith("RW"):
+        raw = raw[2:]
+    try:
+        req_num = int(raw)
+    except Exception:
+        return None
+    res = await session.execute(text("""
+        select id, user_id, amount, status, meta, created_at, updated_at
+        from referral_withdrawals
+        where id = :id
+        limit 1;
+    """), {"id": req_num})
+    row = res.mappings().first()
+    return dict(row) if row else None
+
+
 async def update_ref_withdraw_status(session: AsyncSession, req_id: str, status: str, meta: dict | None = None) -> None:
-    withdrawals = await get_ref_withdrawals(session)
-    updated: list[dict[str, Any]] = []
-    for item in withdrawals:
-        if item.get("id") == req_id:
-            item = dict(item)
-            item["status"] = status
-            if meta:
-                item["meta"] = meta
-            updated.append(item)
-        else:
-            updated.append(item)
-    await _save_setting(session, "REFERRAL_WITHDRAWALS", updated)
+    await _ensure_referral_schema(session)
+    raw = str(req_id or "")
+    if raw.upper().startswith("RW"):
+        raw = raw[2:]
+    try:
+        req_num = int(raw)
+    except Exception:
+        return
+    await session.execute(text("""
+        update referral_withdrawals
+        set status = :status,
+            meta = COALESCE(meta, '{}'::jsonb) || CAST(:meta AS jsonb),
+            updated_at = now()
+        where id = :id;
+    """), {
+        "status": status,
+        "meta": json.dumps(meta or {}),
+        "id": req_num,
+    })
+
+
+async def _next_user_ticket_id(session: AsyncSession, user_id: int) -> int:
+    await _ensure_support_schema(session)
+    res = await session.execute(text("""
+        select coalesce(max(user_ticket_id), 0) + 1 as next_id
+        from support_tickets
+        where user_id = :user_id;
+    """), {"user_id": user_id})
+    row = res.mappings().first()
+    return int(row["next_id"]) if row else 1
+
+
+async def get_support_tickets(session: AsyncSession) -> list[dict[str, Any]]:
+    await _ensure_support_schema(session)
+    res = await session.execute(text("""
+        select id, user_id, tg_user_id, chat_id, username, status, user_ticket_id, created_at, updated_at, message_count
+        from support_tickets
+        order by updated_at desc;
+    """))
+    return [dict(r) for r in res.mappings().all()]
+
+
+async def _save_support_tickets(session: AsyncSession, tickets: list[dict[str, Any]]) -> None:
+    await _ensure_support_schema(session)
+    for t in tickets:
+        await session.execute(text("""
+            insert into support_tickets
+              (id, user_id, tg_user_id, chat_id, username, status, user_ticket_id, created_at, updated_at, message_count)
+            values
+              (:id, :user_id, :tg_user_id, :chat_id, :username, :status, :user_ticket_id, :created_at, :updated_at, :message_count)
+            on conflict (id) do update set
+              status = excluded.status,
+              updated_at = excluded.updated_at,
+              message_count = excluded.message_count;
+        """), {
+            "id": t.get("id"),
+            "user_id": t.get("user_id"),
+            "tg_user_id": t.get("tg_user_id"),
+            "chat_id": t.get("chat_id"),
+            "username": t.get("username"),
+            "status": t.get("status"),
+            "user_ticket_id": t.get("user_ticket_id"),
+            "created_at": t.get("created_at"),
+            "updated_at": t.get("updated_at"),
+            "message_count": t.get("message_count") or 0,
+        })
+
+
+async def get_support_messages(session: AsyncSession) -> list[dict[str, Any]]:
+    await _ensure_support_schema(session)
+    res = await session.execute(text("""
+        select id, ticket_id, sender, text, created_at
+        from support_messages
+        order by created_at asc;
+    """))
+    return [dict(r) for r in res.mappings().all()]
+
+
+async def _save_support_messages(session: AsyncSession, messages: list[dict[str, Any]]) -> None:
+    await _ensure_support_schema(session)
+    for m in messages:
+        await session.execute(text("""
+            insert into support_messages (id, ticket_id, sender, text, created_at)
+            values (:id, :ticket_id, :sender, :text, :created_at)
+            on conflict (id) do nothing;
+        """), {
+            "id": m.get("id"),
+            "ticket_id": m.get("ticket_id"),
+            "sender": m.get("sender"),
+            "text": m.get("text"),
+            "created_at": m.get("created_at"),
+        })
+
+
+async def list_support_tickets_for_user(session: AsyncSession, user_id: int) -> list[dict[str, Any]]:
+    await _ensure_support_schema(session)
+    res = await session.execute(text("""
+        select id, user_id, tg_user_id, chat_id, username, status, user_ticket_id, created_at, updated_at, message_count
+        from support_tickets
+        where user_id = :user_id
+        order by updated_at desc;
+    """), {"user_id": user_id})
+    return [dict(r) for r in res.mappings().all()]
+
+
+async def get_support_ticket(session: AsyncSession, ticket_id: int) -> dict[str, Any] | None:
+    await _ensure_support_schema(session)
+    res = await session.execute(text("""
+        select id, user_id, tg_user_id, chat_id, username, status, user_ticket_id, created_at, updated_at, message_count
+        from support_tickets
+        where id = :id
+        limit 1;
+    """), {"id": ticket_id})
+    row = res.mappings().first()
+    return dict(row) if row else None
+
+
+async def count_open_tickets_for_user(session: AsyncSession, user_id: int) -> int:
+    await _ensure_support_schema(session)
+    res = await session.execute(text("""
+        select count(*) as cnt
+        from support_tickets
+        where user_id = :user_id and status = 'open';
+    """), {"user_id": user_id})
+    row = res.mappings().first()
+    return int(row["cnt"]) if row else 0
+
+
+async def get_last_open_ticket_for_user(session: AsyncSession, user_id: int) -> dict[str, Any] | None:
+    await _ensure_support_schema(session)
+    res = await session.execute(text("""
+        select id, user_id, tg_user_id, chat_id, username, status, user_ticket_id, created_at, updated_at, message_count
+        from support_tickets
+        where user_id = :user_id and status = 'open'
+        order by updated_at desc
+        limit 1;
+    """), {"user_id": user_id})
+    row = res.mappings().first()
+    return dict(row) if row else None
+
+
+async def add_support_ticket(session: AsyncSession, user: dict, text: str) -> dict[str, Any]:
+    await _ensure_support_schema(session)
+    user_ticket_id = await _next_user_ticket_id(session, int(user["user_id"]))
+    res = await session.execute(text("""
+        insert into support_tickets
+          (user_id, tg_user_id, chat_id, username, status, user_ticket_id, created_at, updated_at, message_count)
+        values
+          (:user_id, :tg_user_id, :chat_id, :username, 'open', :user_ticket_id, now(), now(), 0)
+        returning id, user_id, tg_user_id, chat_id, username, status, user_ticket_id, created_at, updated_at, message_count;
+    """), {
+        "user_id": int(user["user_id"]),
+        "tg_user_id": int(user["tg_user_id"]),
+        "chat_id": int(user["chat_id"]),
+        "username": user.get("username"),
+        "user_ticket_id": user_ticket_id,
+    })
+    ticket = dict(res.mappings().first())
+    await add_support_message(session, ticket["id"], "user", text)
+    return ticket
+
+
+async def add_support_message(session: AsyncSession, ticket_id: int, sender: str, text: str) -> None:
+    await _ensure_support_schema(session)
+    await session.execute(text("""
+        insert into support_messages (ticket_id, sender, text, created_at)
+        values (:ticket_id, :sender, :text, now());
+    """), {"ticket_id": int(ticket_id), "sender": sender, "text": text})
+    await session.execute(text("""
+        update support_tickets
+        set updated_at = now(),
+            message_count = message_count + 1
+        where id = :ticket_id;
+    """), {"ticket_id": int(ticket_id)})
+
+
+async def list_support_messages_for_ticket(session: AsyncSession, ticket_id: int, limit: int = 10) -> list[dict[str, Any]]:
+    await _ensure_support_schema(session)
+    res = await session.execute(text("""
+        select id, ticket_id, sender, text, created_at
+        from support_messages
+        where ticket_id = :ticket_id
+        order by created_at asc
+        limit :limit;
+    """), {"ticket_id": int(ticket_id), "limit": int(limit)})
+    return [dict(r) for r in res.mappings().all()]
+
+
+async def close_support_ticket(session: AsyncSession, ticket_id: int) -> None:
+    await _ensure_support_schema(session)
+    await session.execute(text("""
+        update support_tickets
+        set status = 'closed', updated_at = now()
+        where id = :ticket_id;
+    """), {"ticket_id": int(ticket_id)})
 
 
 async def count_referrals(session: AsyncSession, referrer_user_id: int) -> int:
@@ -192,27 +544,38 @@ async def count_referrals(session: AsyncSession, referrer_user_id: int) -> int:
 
 
 async def get_referral_wallet(session: AsyncSession, referrer_user_id: int) -> int:
-    key = f"REF_WALLET_{referrer_user_id}"
-    value = await _load_setting(session, key, {"balance": 0})
-    try:
-        if isinstance(value, dict):
-            return int(value.get("balance") or 0)
-        return int(value or 0)
-    except Exception:
-        return 0
+    await _ensure_referral_schema(session)
+    res = await session.execute(text("""
+        insert into referral_wallets (user_id, balance, updated_at)
+        values (:user_id, 0, now())
+        on conflict (user_id) do update set updated_at = now()
+        returning balance;
+    """), {"user_id": referrer_user_id})
+    row = res.mappings().first()
+    return int(row["balance"]) if row else 0
 
 
 async def add_referral_wallet(session: AsyncSession, referrer_user_id: int, amount: int) -> int:
-    current = await get_referral_wallet(session, referrer_user_id)
-    new_balance = current + int(amount)
-    key = f"REF_WALLET_{referrer_user_id}"
-    await _save_setting(session, key, {"balance": new_balance})
-    return new_balance
+    await _ensure_referral_schema(session)
+    res = await session.execute(text("""
+        insert into referral_wallets (user_id, balance, updated_at)
+        values (:user_id, :amount, now())
+        on conflict (user_id) do update
+        set balance = referral_wallets.balance + :amount,
+            updated_at = now()
+        returning balance;
+    """), {"user_id": referrer_user_id, "amount": int(amount)})
+    row = res.mappings().first()
+    return int(row["balance"]) if row else 0
 
 
 async def clear_referral_wallet(session: AsyncSession, referrer_user_id: int) -> None:
-    key = f"REF_WALLET_{referrer_user_id}"
-    await _save_setting(session, key, {"balance": 0})
+    await _ensure_referral_schema(session)
+    await session.execute(text("""
+        update referral_wallets
+        set balance = 0, updated_at = now()
+        where user_id = :user_id;
+    """), {"user_id": referrer_user_id})
 
 
 async def add_referral_pending(
@@ -222,6 +585,7 @@ async def add_referral_pending(
     amount_minor: int,
     order_id: int,
 ) -> int:
+    await _ensure_referral_schema(session)
     settings = await get_referral_settings(session)
     percent = int(settings.get("percent") or 0)
     if percent <= 0:
@@ -229,20 +593,25 @@ async def add_referral_pending(
     bonus = int(amount_minor * percent / 100)
     if bonus <= 0:
         return 0
-    pending = await get_referral_pending(session)
-    if any(p.get("order_id") == order_id for p in pending):
-        return 0
     due_at = datetime.now(timezone.utc) + timedelta(hours=int(settings.get("delay_hours") or 0))
-    pending.append({
+    res = await session.execute(text("""
+        insert into referral_pending
+          (order_id, referrer_user_id, referred_user_id, amount_minor, bonus_minor, percent, due_at)
+        values
+          (:order_id, :referrer_user_id, :referred_user_id, :amount_minor, :bonus_minor, :percent, :due_at)
+        on conflict (order_id) do nothing
+        returning id;
+    """), {
         "order_id": order_id,
         "referrer_user_id": referrer_user_id,
         "referred_user_id": referred_user_id,
         "amount_minor": amount_minor,
         "bonus_minor": bonus,
         "percent": percent,
-        "due_at": due_at.isoformat(),
+        "due_at": due_at,
     })
-    await _save_setting(session, "REFERRAL_PENDING", pending)
+    if not res.mappings().first():
+        return 0
     return bonus
 
 
@@ -262,33 +631,52 @@ async def has_referral_bonus(session: AsyncSession, order_id: int) -> bool:
 
 
 async def process_referral_pending(session: AsyncSession, referrer_user_id: int) -> int:
-    pending = await get_referral_pending(session)
-    if not pending:
-        return 0
-    now = datetime.now(timezone.utc)
-    new_pending: list[dict[str, Any]] = []
+    await _ensure_referral_schema(session)
+    canonical_ref_id = await resolve_referrer_user_id(session, referrer_user_id)
+    if not canonical_ref_id:
+        canonical_ref_id = referrer_user_id
+    res = await session.execute(text("""
+        select id, order_id, referrer_user_id, bonus_minor, due_at
+        from referral_pending
+        where due_at <= now();
+    """))
+    rows = [dict(r) for r in res.mappings().all()]
     applied = 0
-    for item in pending:
-        if int(item.get("referrer_user_id") or 0) != referrer_user_id:
-            new_pending.append(item)
-            continue
-        due_at_raw = item.get("due_at")
-        try:
-            due_at = datetime.fromisoformat(due_at_raw)
-        except Exception:
-            due_at = now
-        if due_at > now:
-            new_pending.append(item)
-            continue
-        order_id = int(item.get("order_id") or 0)
-        if order_id and await has_referral_bonus(session, order_id):
-            continue
+    for item in rows:
+        item_ref_id = int(item.get("referrer_user_id") or 0)
+        if item_ref_id != canonical_ref_id:
+            resolved = await resolve_referrer_user_id(session, item_ref_id)
+            if resolved != canonical_ref_id:
+                continue
         bonus = int(item.get("bonus_minor") or 0)
         if bonus <= 0:
             continue
-        await add_referral_wallet(session, referrer_user_id, bonus)
+        await add_referral_wallet(session, canonical_ref_id, bonus)
+        await session.execute(text("delete from referral_pending where id = :id"), {"id": item["id"]})
         applied += 1
-    await _save_setting(session, "REFERRAL_PENDING", new_pending)
+    return applied
+
+
+async def process_referral_pending_all(session: AsyncSession) -> int:
+    await _ensure_referral_schema(session)
+    res = await session.execute(text("""
+        select id, order_id, referrer_user_id, bonus_minor, due_at
+        from referral_pending
+        where due_at <= now();
+    """))
+    rows = [dict(r) for r in res.mappings().all()]
+    applied = 0
+    for item in rows:
+        bonus = int(item.get("bonus_minor") or 0)
+        if bonus <= 0:
+            continue
+        item_ref_id = int(item.get("referrer_user_id") or 0)
+        ref_user_id = await resolve_referrer_user_id(session, item_ref_id)
+        if not ref_user_id:
+            continue
+        await add_referral_wallet(session, ref_user_id, bonus)
+        await session.execute(text("delete from referral_pending where id = :id"), {"id": item["id"]})
+        applied += 1
     return applied
 
 
@@ -392,6 +780,140 @@ async def load_admin_ids(session: AsyncSession) -> list[int]:
         return []
     ids = row["value_json"] or []
     return [int(x) for x in ids]
+
+
+async def get_promo_codes(session: AsyncSession) -> list[dict[str, Any]]:
+    await _ensure_promo_schema(session)
+    res = await session.execute(text("""
+        select code, bonus, active, max_uses, used_count, expires_at
+        from promo_codes
+        order by code asc;
+    """))
+    return [dict(r) for r in res.mappings().all()]
+
+
+async def _save_promo_codes(session: AsyncSession, codes: list[dict[str, Any]]) -> None:
+    await _ensure_promo_schema(session)
+    for c in codes:
+        await session.execute(text("""
+            insert into promo_codes (code, bonus, active, max_uses, used_count, expires_at, updated_at)
+            values (:code, :bonus, :active, :max_uses, :used_count, :expires_at, now())
+            on conflict (code) do update set
+                bonus = excluded.bonus,
+                active = excluded.active,
+                max_uses = excluded.max_uses,
+                used_count = excluded.used_count,
+                expires_at = excluded.expires_at,
+                updated_at = now();
+        """), {
+            "code": str(c.get("code") or "").upper(),
+            "bonus": int(c.get("bonus") or 0),
+            "active": bool(c.get("active", True)),
+            "max_uses": c.get("max_uses"),
+            "used_count": int(c.get("used_count") or 0),
+            "expires_at": c.get("expires_at"),
+        })
+
+
+async def _get_promo_used(session: AsyncSession, user_id: int) -> list[str]:
+    await _ensure_promo_schema(session)
+    res = await session.execute(text("""
+        select code from promo_usages where user_id = :user_id;
+    """), {"user_id": user_id})
+    return [str(r["code"]).upper() for r in res.mappings().all()]
+
+
+async def _save_promo_used(session: AsyncSession, user_id: int, used: list[str]) -> None:
+    await _ensure_promo_schema(session)
+    for code in set([str(u).upper() for u in used]):
+        await session.execute(text("""
+            insert into promo_usages (user_id, code, used_at)
+            values (:user_id, :code, now())
+            on conflict (user_id, code) do nothing;
+        """), {"user_id": user_id, "code": code})
+
+
+async def redeem_promo(session: AsyncSession, user_id: int, code_raw: str) -> tuple[bool, str, int]:
+    code = (code_raw or "").strip().upper()
+    if not code:
+        return False, "Введите промокод.", 0
+
+    await _ensure_promo_schema(session)
+    res = await session.execute(text("""
+        select code, bonus, active, max_uses, used_count, expires_at
+        from promo_codes
+        where upper(code) = :code
+        limit 1;
+    """), {"code": code})
+    promo = res.mappings().first()
+    if not promo or not promo.get("active", True):
+        return False, "Промокод не найден или не активен.", 0
+
+    res = await session.execute(text("""
+        select 1 from promo_usages where user_id = :user_id and code = :code limit 1;
+    """), {"user_id": user_id, "code": code})
+    if res.mappings().first():
+        return False, "Вы уже использовали этот промокод.", 0
+
+    expires_at = promo.get("expires_at")
+    if expires_at:
+        try:
+            exp = datetime.fromisoformat(str(expires_at))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp < datetime.now(timezone.utc):
+                return False, "Срок действия промокода истек.", 0
+        except Exception:
+            pass
+
+    max_uses = promo.get("max_uses")
+    used_count = int(promo.get("used_count") or 0)
+    if max_uses is not None:
+        try:
+            if used_count >= int(max_uses):
+                return False, "Лимит использований промокода исчерпан.", 0
+        except Exception:
+            pass
+
+    bonus = int(promo.get("bonus") or 0)
+    if bonus <= 0:
+        return False, "Промокод настроен некорректно.", 0
+
+    # increment used_count safely
+    res = await session.execute(text("""
+        update promo_codes
+        set used_count = used_count + 1, updated_at = now()
+        where upper(code) = :code
+          and (max_uses is null or used_count < max_uses)
+        returning used_count;
+    """), {"code": code})
+    if not res.mappings().first():
+        return False, "Лимит использований промокода исчерпан.", 0
+
+    new_balance = await apply_balance_delta(
+        session,
+        user_id,
+        bonus,
+        "promo_bonus",
+        {"code": code, "bonus": bonus},
+    )
+    await log_event(
+        session,
+        "user_actions",
+        "info",
+        None,
+        user_id,
+        "promo_redeemed",
+        None,
+        {"code": code, "bonus": bonus},
+    )
+    await session.execute(text("""
+        insert into promo_usages (user_id, code, used_at)
+        values (:user_id, :code, now())
+        on conflict (user_id, code) do nothing;
+    """), {"user_id": user_id, "code": code})
+
+    return True, f"✅ Промокод принят.\n\nНа баланс начислено {bonus} ₽.", new_balance
 
 
 async def load_last_paid_order(session: AsyncSession, user_id: int) -> dict[str, Any] | None:
