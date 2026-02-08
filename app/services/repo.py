@@ -474,7 +474,7 @@ async def get_last_open_ticket_for_user(session: AsyncSession, user_id: int) -> 
     return dict(row) if row else None
 
 
-async def add_support_ticket(session: AsyncSession, user: dict, text: str) -> dict[str, Any]:
+async def add_support_ticket(session: AsyncSession, user: dict, message_text: str) -> dict[str, Any]:
     await _ensure_support_schema(session)
     user_ticket_id = await _next_user_ticket_id(session, int(user["user_id"]))
     res = await session.execute(text("""
@@ -491,7 +491,7 @@ async def add_support_ticket(session: AsyncSession, user: dict, text: str) -> di
         "user_ticket_id": user_ticket_id,
     })
     ticket = dict(res.mappings().first())
-    await add_support_message(session, ticket["id"], "user", text)
+    await add_support_message(session, ticket["id"], "user", message_text)
     return ticket
 
 
